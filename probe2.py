@@ -61,8 +61,11 @@ def diag_new_key(self):
     print(f"  AUTH_ALG   = {auth:>3}  -> {AUTH_ALG.get(auth, 'UNKNOWN')}", flush=True)
     print(f"  IPCOMP_ALG = {ipcomp:>3}  -> {IPCOMP_ALG.get(ipcomp, 'UNKNOWN')}", flush=True)
     print("", flush=True)
-    print(f"  hilldust needs: ENC_ALG=3 (des3_cbc), "
-          f"AUTH_ALG=2 (hmac-sha1-96), IPCOMP_ALG=0 (none)", flush=True)
+    supported = ", ".join(
+        "ENC_ALG=%d AUTH_ALG=%d (%s + %s)"
+        % (enc, auth, algo.crypt_algo, algo.auth_algo)
+        for (enc, auth), algo in sorted(hillstone.IPSEC_ALGOS.items()))
+    print(f"  IPSEC_ALGOS supports: {supported}", flush=True)
     raise SystemExit(0)
 
 
