@@ -1,0 +1,91 @@
+diff --git a/hillstone.py b/hillstone.py
+index 3bad55c..7ef3353 100644
+--- a/hillstone.py
++++ b/hillstone.py
+@@ -184,6 +184,25 @@ class Message(object):
+         return b_prefix + size + b
+ 
+ 
++class IPSecAlgo(object):
++    """One ESP cipher suite plus the key material sizes it consumes."""
++    def __init__(self, crypt_algo, crypt_size, iv_size, auth_algo, auth_size):
++        self.crypt_algo = crypt_algo
++        self.crypt_size = crypt_size
++        self.iv_size = iv_size
++        self.auth_algo = auth_algo
++        self.auth_size = auth_size
++
++
++# (ENC_ALG, AUTH_ALG) as returned by the gateway in the NEW_KEY reply.
++# Sizes follow the gateway's own mapping: auth_size is the HMAC key length
++# (md5 -> 16, sha1 -> 20), crypt_size the cipher key length.
++IPSEC_ALGOS = {
++    (3, 2): IPSecAlgo('3DES', 0x18, 8, 'HMAC-SHA1-96', 0x14),      # des3_cbc / hmac-sha1-96
++    (12, 1): IPSecAlgo('AES-CBC', 0x10, 16, 'HMAC-MD5-96', 0x10),  # aes128_cbc / hmac-md5-96
++}
++
++
+ class IPSecParameters(object):
+     def __init__(self, in_spi, out_spi, keymat, iv_size, auth_size, crypt_size):
+         from hashlib import sha1
+@@ -213,6 +232,7 @@ class ClientCore(object):
+         self.server_port = -1
+ 
+         self.ipsec_param = None
++        self.ipsec_algo = None
+         self.session_id = -1
+         self.server_udp_port = -1
+         self.ip_ipv4 = None
+@@ -285,11 +305,20 @@ class ClientCore(object):
+         msg_id, res, _ = Unpack(self.socket.recv(4096))
+         if res[Payload.STATUS] != b'\0\0\0\0':
+             raise NewKeyError
+-        if res[Payload.ENC_ALG] != b'\0\x03' or res[Payload.AUTH_ALG] != b'\0\x02' or res[Payload.IPCOMP_ALG] != b'\0\0':
++        if res[Payload.IPCOMP_ALG] != b'\0\0':
++            raise NotSupported
++        self.ipsec_algo = IPSEC_ALGOS.get((
++            int.from_bytes(res[Payload.ENC_ALG], byteorder='big'),
++            int.from_bytes(res[Payload.AUTH_ALG], byteorder='big'),
++        ))
++        if self.ipsec_algo is None:
+             raise NotSupported
+         outbound_spi = int.from_bytes(res[Payload.SPI], byteorder='big')
+         # outbound_cpi = int.from_bytes(res[Payload.IPCOMP_CPI], byteorder='big')
+-        self.ipsec_param = IPSecParameters(inbound_spi, outbound_spi, key_material, auth_size=0x14, crypt_size=0x18, iv_size=8)
++        self.ipsec_param = IPSecParameters(inbound_spi, outbound_spi, key_material,
++                                           auth_size=self.ipsec_algo.auth_size,
++                                           crypt_size=self.ipsec_algo.crypt_size,
++                                           iv_size=self.ipsec_algo.iv_size)
+         self.session_id = res[Payload.SESSION_ID]
+ 
+     def logout(self):
+diff --git a/impl_scapy.py b/impl_scapy.py
+index b03c677..4612ad6 100644
+--- a/impl_scapy.py
++++ b/impl_scapy.py
+@@ -11,20 +11,21 @@ class Client(hillstone.ClientCore):
+ 
+     def new_key(self):
+         super().new_key()
++        algo = self.ipsec_algo
+         self.outbound_sa = scapy.all.SecurityAssociation(
+             proto=scapy.all.ESP,
+             spi=self.ipsec_param.out_spi,
+-            crypt_algo='3DES',
++            crypt_algo=algo.crypt_algo,
+             crypt_key=self.ipsec_param.out_crypt_key,
+-            auth_algo='HMAC-SHA1-96',
++            auth_algo=algo.auth_algo,
+             auth_key=self.ipsec_param.out_auth_key
+         )
+         self.inbound_sa = scapy.all.SecurityAssociation(
+             proto=scapy.all.ESP,
+             spi=self.ipsec_param.in_spi,
+-            crypt_algo='3DES',
++            crypt_algo=algo.crypt_algo,
+             crypt_key=self.ipsec_param.in_crypt_key,
+-            auth_algo='HMAC-SHA1-96',
++            auth_algo=algo.auth_algo,
+             auth_key=self.ipsec_param.in_auth_key
+         )
+ 

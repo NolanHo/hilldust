@@ -1,0 +1,33 @@
+name: hillstone-vpn
+
+services:
+  vpn:
+    build:
+      context: .
+    image: hillstone-vpn:5.7.1
+    container_name: hillstone-vpn
+    restart: unless-stopped
+
+    # hilldust.py blocks on input('Enter to exit.') -> keep stdin open.
+    stdin_open: true
+
+    # Own network namespace: hilldust's `ip route replace default` and
+    # /etc/resolv.conf rewrite stay inside the container.
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun
+
+    env_file:
+      - secret.env          # HILLSTONE_SERVER / HILLSTONE_USER / HILLSTONE_PASSWORD
+
+    ports:
+      # loopback only -- reach it from another machine with an SSH forward:
+      #   ssh -N -L 1080:127.0.0.1:1080 <host>
+      - "127.0.0.1:1080:1080"
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "3"
