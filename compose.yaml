@@ -8,23 +8,30 @@ services:
     container_name: hillstone-vpn
     restart: unless-stopped
 
-    # hilldust.py blocks on input('Enter to exit.') -> keep stdin open.
-    stdin_open: true
-
-    # Own network namespace: hilldust's `ip route replace default` and
-    # /etc/resolv.conf rewrite stay inside the container.
+    # Own network namespace: hilldust's routing and DNS changes stay inside
+    # the container, and are reverted by deleting the namespace. Never use
+    # network_mode: host here -- that is the failure mode this exists to
+    # avoid.
     cap_add:
       - NET_ADMIN
     devices:
       - /dev/net/tun
 
     env_file:
-      - secret.env          # HILLSTONE_SERVER / HILLSTONE_USER / HILLSTONE_PASSWORD
+      - secret.env          # HILLSTONE_SERVER / _USER / _PASSWORD
 
     ports:
       # loopback only -- reach it from another machine with an SSH forward:
       #   ssh -N -L 1080:127.0.0.1:1080 <host>
       - "127.0.0.1:1080:1080"
+
+    healthcheck:
+      # The 0.0.0.0/1 split route exists only while a session is up.
+      test: ["CMD-SHELL", "ip route show 0.0.0.0/1 2>/dev/null | grep -q ."]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
 
     logging:
       driver: json-file

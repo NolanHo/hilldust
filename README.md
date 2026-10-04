@@ -5,16 +5,15 @@
 (Unofficial) Yet another implementation of the *Hillstone™ Secure Connect VPN
 Client* for Linux.
 
-> This is a fork of [LionNatsu/hilldust](https://github.com/LionNatsu/hilldust).
+> A fork of [LionNatsu/hilldust](https://github.com/LionNatsu/hilldust).
 > Upstream is a proof of concept, last touched 2020-04-22. See
-> [What this fork adds](#what-this-fork-adds) for the delta.
+> [Differences from upstream](#differences-from-upstream).
 
 ---
 
-## Read this first: hilldust rewrites your host's network
+## Read this first: upstream rewrites your host's network
 
-`platform_linux.py` — **unmodified upstream code** — does the following the
-moment a tunnel comes up:
+Upstream `platform_linux.py` does the following the moment a tunnel comes up:
 
 ```python
 subprocess.check_call('ip route replace default metric 0 via ' + str(c.gateway_ipv4), shell=True)
@@ -31,63 +30,61 @@ Four consequences:
 1. **The default route is replaced, not added.** Every packet the machine
    sends — from every process, every container, every SSH session you have
    open — is re-routed into the tunnel. There is no split-tunnel switch.
-2. **`/etc/resolv.conf` is overwritten in place**, and its only backup lives
-   in the process's memory.
-3. **The restore path is not guaranteed to run.** `restore_network()` is
-   called only after a normal exit:
-
-   ```python
-   try:
-       input('Enter to exit.')
-   except KeyboardInterrupt:
-       pass
-   platform_linux.restore_network(c)
-   ```
-
-   `SIGTERM`, `SIGKILL`, a crash, an OOM kill, or simply closing the SSH
-   session you launched it from all skip it. You are left with a rewritten
-   default route and a rewritten resolver, on a machine whose own
-   connectivity now depends on a tunnel that is no longer running.
+2. **`/etc/resolv.conf` is overwritten in place**, its only backup in
+   process memory.
+3. **The restore path is not guaranteed to run.** It fires only after a
+   normal exit (`input('Enter to exit.')` / `Ctrl-C`). `SIGTERM`,
+   `SIGKILL`, a crash, an OOM kill, or simply losing the SSH session you
+   launched it from all skip it.
 4. **The restore path is itself destructive.** It runs
    `ip route flush table main` before `ip route restore`, against a blob
-   captured at connect time. If that blob is stale — routes added by Docker,
-   WireGuard or a DHCP renewal after the tunnel came up — they are flushed
-   and not restored.
-
-On a throwaway laptop this is an annoyance. On a server that also runs a
-WireGuard mesh, Docker bridges and other people's services, it is an outage
-waiting for a `Ctrl-C` that never comes.
+   captured at connect time. Routes added since — by Docker, WireGuard, a
+   DHCP renewal — are flushed and not restored.
 
 ### Our motivation
 
-We wanted to keep using the Hillstone gateway without any of that, and
-without the vendor's own macOS client either — an unsigned binary that
-installs a root `LaunchDaemon` executing from a user-writable bundle, plus a
-root shell that re-runs every 5 seconds.
+We wanted to keep using a Hillstone gateway without any of that, and without
+the vendor's macOS client either: an unsigned binary that installs a root
+`LaunchDaemon` executing out of a user-writable bundle, alongside a root
+shell that re-runs every 5 seconds.
 
 This fork runs hilldust **inside a container with its own network
-namespace**. Both destructive writes above then land in the container's
-netns, and `docker compose down` reverts them by removing the namespace
-entirely. The host keeps its routes, its resolver, and no tun device.
-
-The container also solves a second problem: upstream hilldust only
-implements 3DES-CBC + HMAC-SHA1-96, and current Hillstone gateways
-negotiate AES-128-CBC + HMAC-MD5-96. See [The patch](#the-patch).
+namespace**, so even the writes above would land in a throwaway namespace
+that `docker compose down` deletes. It also stops doing most of them in the
+first place — see below.
 
 ---
 
-## What this fork adds
+## Differences from upstream
 
-| File | Purpose |
-| --- | --- |
-| `patches/0001-*.patch` | adds AES-128-CBC + HMAC-MD5-96 support |
-| `shim/sitecustomize.py` | restores `ssl.wrap_socket()`, removed in Python 3.12 |
-| `Dockerfile`, `compose.yaml`, `entrypoint.sh` | run it confined, with a SOCKS5 exit |
-| `probe.py`, `probe2.py`, `probe3.py` | diagnosis without guessing |
-| `secret.env.example` | credential template |
+| Area | Upstream | This fork |
+| --- | --- | --- |
+| Default route | replaced outright | left alone; two `/1` routes are added alongside it and removed on exit |
+| Routing restore | flush table, restore stale blob | deletes exactly the routes it added; a crash leaves the original default intact |
+| **ESP data path** | scapy builds a Packet object per datagram | `cryptography` directly — **0.8 MB/s → 9.5 MB/s measured** on the same link |
+| Tun MTU | default (1500) | 1380, matching the vendor client's `VnicMTU`, so packets are not fragmented |
+| Socket buffers | system default | 4 MiB via `SO_*BUFFFORCE` (the container has `CAP_NET_ADMIN`) |
+| Ciphers | 3DES-CBC + HMAC-SHA1-96 only, else `NotSupported` | lookup table; adds AES-128-CBC + HMAC-MD5-96, which current gateways negotiate |
+| TLS setup | `ssl.wrap_socket()` (removed in Python 3.12) | `SSLContext`, runs on 3.12+ |
+| Message framing | one `recv()` assumed to be one packet | reads exactly the declared length |
+| Dead tunnel | undetected, process idles forever | data-plane probe (DNS over the tunnel) → teardown and reconnect with exponential backoff |
+| Shutdown | `input()` blocks; SIGTERM skips cleanup | SIGINT/SIGTERM tear the network down |
+| Errors | `AuthError`, no reason | the gateway's own status code and message |
+| Tests | none | `selftest.py` pins the ESP wire format; the image build fails if it breaks |
 
-Upstream `.py` files are kept byte-identical; everything is applied at image
-build time so the delta stays reviewable.
+## Performance
+
+Measured on the same gateway and link, 10 MB download through the tunnel:
+
+| | throughput | CPU ceiling measured |
+| --- | --- | --- |
+| upstream (scapy ESP) | 0.80 MB/s (6.4 Mbps) | 7.8 Mbps |
+| this fork (`cryptography` ESP) | **9.5 MB/s (76 Mbps)** | 445 Mbps |
+
+The `cryptography` ESP implementation was verified byte-for-byte against
+scapy's output over every padding residue, in both directions, before being
+swapped in — and `selftest.py` freezes that format so a future change cannot
+silently break interoperability with the gateway.
 
 ## Quick start (Docker, recommended)
 
@@ -96,9 +93,10 @@ cp secret.env.example secret.env
 $EDITOR secret.env          # gateway, username, password
 chmod 600 secret.env
 
-docker compose build
+docker compose build        # runs selftest.py; fails if the wire format breaks
 docker compose up -d
-docker compose logs -f      # expect: "Network configured."
+docker compose logs -f      # expect: "tunnel up on tun0 (mtu 1380)"
+docker compose ps           # expect: healthy
 ```
 
 A SOCKS5 proxy is then published on `127.0.0.1:1080` of the host. It is
@@ -110,52 +108,57 @@ ssh -N -L 1080:127.0.0.1:1080 <host>
 curl --socks5-hostname 127.0.0.1:1080 https://api.ipify.org
 ```
 
-Note the SOCKS proxy gives you a **full tunnel**: the container's default
-route goes through the VPN, so anything you hand it exits via the remote
+The proxy is a **full tunnel**: everything you hand it exits via the remote
 gateway, not your local line. Route only the domains that need it.
+
+### Tuning
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `HILLDUST_MTU` | 1380 | tun MTU; lower it if large packets still disappear |
+| `HILLDUST_LIVENESS` | on | set to `off` to disable the data-plane probe |
+| `HILLDUST_LIVENESS_INTERVAL` | 15 | seconds between probes |
+| `HILLDUST_LIVENESS_FAILURES` | 3 | consecutive misses before reconnecting |
 
 ### Requirements
 
-* `/dev/net/tun` present on the host
-* the container needs `NET_ADMIN` and the tun device, nothing else
-* no `--privileged`, no `--network host`
+* `/dev/net/tun` on the host
+* `NET_ADMIN` and that device — no `--privileged`, no `network_mode: host`
 
 ## Alternative: run it natively
 
-If you accept the caveats above — a disposable VM, a lab box, a namespace of
-your own — upstream usage still works:
+```bash
+sudo HILLSTONE_PASSWORD=... ./hilldust.py vpn.example.com:10443 username
+```
+
+`sudo` is required for the tun device and the routing table. Passing the
+password in the environment keeps it out of `ps`.
+
+The non-destructive routing means a crash no longer strands the machine: the
+original default route is still there, shadowed by two `/1` routes you can
+remove with
 
 ```bash
-sudo ./hilldust.py vpn.example.com:10443 username password
+sudo ip route del 0.0.0.0/1; sudo ip route del 128.0.0.0/1
 ```
 
-`sudo` is required for the tun device and the routing table.
+## Layout
 
-## The patch
-
-Upstream aborts with `NotSupported` unless the gateway answers the NEW_KEY
-exchange with `ENC_ALG=3` (3DES-CBC) and `AUTH_ALG=2` (HMAC-SHA1-96):
-
-```python
-if res[Payload.ENC_ALG] != b'\0\x03' or res[Payload.AUTH_ALG] != b'\0\x02' or ...:
-    raise NotSupported
-```
-
-Current gateways answer `ENC_ALG=12` (aes128_cbc) / `AUTH_ALG=1`
-(hmac-md5-96). The patch replaces the hardcoded check with a lookup table
-mapping `(ENC_ALG, AUTH_ALG)` to a cipher plus its key and IV sizes, and
-hands the negotiated cipher to scapy. Adding another suite is a one-line
-change to `IPSEC_ALGOS`.
-
-The control channel is unaffected — it is TLS, negotiated independently of
-the ESP data channel.
+    hillstone.py       protocol, TLS control channel, cipher negotiation
+    esp.py             ESP data path on cryptography
+    tunnel.py          the UDP tunnel client
+    platform_linux.py  tun device, routes, resolver
+    hilldust.py        CLI, session loop, reconnect, signals
+    selftest.py        known-answer and invariant tests for the ESP format
+    probe.py           TLS + ESP check, no login attempted
+    probe2.py          dumps the negotiated algorithms (logs in)
 
 ## Diagnostics
 
 | Script | What it does | Login? |
 | --- | --- | --- |
-| `probe3.py` | prints scapy's supported ciphers and key sizes | no |
-| `probe.py` | TLS handshake + shim check | **no** |
+| `selftest.py` | ESP format regression test | no |
+| `probe.py` | TLS handshake + one ESP round trip per `IPSEC_ALGOS` entry | **no** |
 | `probe2.py` | dumps the NEW_KEY reply, i.e. the negotiated algorithms | yes |
 
 ```bash
@@ -163,23 +166,28 @@ docker compose run --rm --no-deps --entrypoint python3 \
   -v "$PWD/probe2.py:/probe2.py:ro" vpn /probe2.py
 ```
 
-`probe.py` deliberately stops before sending AUTH, so probing a gateway
-never increments its failed-login counter.
+`probe.py` stops before sending AUTH, so probing a gateway never records a
+failed login. When a gateway negotiates something unsupported, `probe2.py`
+tells you exactly which pair — and adding it is one row in `IPSEC_ALGOS`
+plus the matching primitives in `esp.py`.
 
 ## Caveats
 
-* Proof of concept. Upstream last commit 2020-04-22; treat accordingly.
-* No device binding: `HOST_ID` / `HOST_NAME` are sent empty. A gateway
-  configured for host checks will reject the login.
-* The gateway certificate is not verified. Neither upstream, nor this fork,
-  nor the vendor's own macOS client (which ships `VerifyServerCert=false`)
-  verifies it.
-* If the UDP data channel dies, hilldust does not notice. The container
-  restarts it, after `RESTART_BACKOFF` (default 30s) so a bad credential
-  cannot hammer the gateway into an account lockout.
+* Proof of concept lineage. Treat accordingly.
+* No device binding: `HOST_ID` / `HOST_NAME` are sent empty. A gateway that
+  enforces host checks will reject the login.
+* The gateway certificate is not authenticated — same as the vendor client,
+  which ships `VerifyServerCert=false`. This buys confidentiality, not
+  authentication.
+* The ESP initialisation vector is fixed for the life of the session, as the
+  vendor protocol dictates. That is a CBC-mode weakness inherited from the
+  protocol, not something this fork can fix unilaterally.
+* Liveness is inferred from the data plane. If the gateway stops answering
+  the probe target while still passing traffic, the session will reconnect
+  unnecessarily; set `HILLDUST_LIVENESS=off` if that happens.
 
 ## Credits and license
 
 Upstream: [LionNatsu/hilldust](https://github.com/LionNatsu/hilldust), GPLv3.
-The Hillstone and Hillstone Secure Connect names belong to Hillstone
-Networks. This project is unofficial and unaffiliated.
+Hillstone and Hillstone Secure Connect are trademarks of Hillstone Networks.
+Unofficial, unaffiliated.

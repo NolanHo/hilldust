@@ -4,34 +4,28 @@ import socket
 import ssl
 import struct
 
+class ProtocolError(Exception):
+    """Malformed or truncated data on the control channel."""
+
+
 class AuthError(Exception):
-    def __init__(self):
-        pass
+    pass
 
 
 class ClientInfoError(Exception):
-    def __init__(self):
-        pass
+    pass
 
 
 class NetworkInfoError(Exception):
-    def __init__(self):
-        pass
-
-
-class NetworkInfoError(Exception):
-    def __init__(self):
-        pass
+    pass
 
 
 class NewKeyError(Exception):
-    def __init__(self):
-        pass
+    pass
 
 
 class NotSupported(Exception):
-    def __init__(self):
-        pass
+    pass
 
 
 class MessageType(enum.Enum):
@@ -145,6 +139,8 @@ def Unpack(packet:bytes) -> (MessageType, dict, bool):
     if magic == 0x0 and reply == 0 and msg_t == 0 and size == 0:
         return MessageType.NONE, {}, True
     if magic != 0x22: raise Exception('Not a packet')
+    if size > len(packet):
+        raise ProtocolError('truncated packet: header says %d, got %d' % (size, len(packet)))
     data = packet[8:size]
     unpacked = {}
     cur = 0
@@ -153,6 +149,76 @@ def Unpack(packet:bytes) -> (MessageType, dict, bool):
         unpacked[Payload(key)] = data[cur+4:cur+4+size]
         cur += 4+size+((4-(size%4))%4)
     return MessageType(msg_t), unpacked, reply == 0x02
+
+
+def recv_exactly(sock, count:int) -> bytes:
+    """Read exactly `count` bytes, or raise if the peer goes away.
+
+    A single recv() can return a partial message: over a real network that
+    is the norm, not the exception. Upstream assumed one recv == one packet.
+    """
+    buf = b''
+    while len(buf) < count:
+        chunk = sock.recv(count - len(buf))
+        if not chunk:
+            raise ConnectionError('control channel closed by peer')
+        buf += chunk
+    return buf
+
+
+def recv_message(sock) -> (MessageType, dict, bool):
+    """Read one complete protocol message off the control channel."""
+    header = recv_exactly(sock, 8)
+    magic, reply, msg_t, size = struct.unpack('!BBHL', header)
+    if magic == 0x0 and reply == 0 and msg_t == 0 and size == 0:
+        return MessageType.NONE, {}, True
+    if magic != 0x22:
+        raise ProtocolError('bad magic 0x%02x on control channel' % magic)
+    if size < 8 or size > 0x100000:
+        raise ProtocolError('implausible packet size %d' % size)
+    return Unpack(header + recv_exactly(sock, size - 8))
+
+
+def _server_message(res:dict) -> str:
+    """The human-readable error text the gateway may attach."""
+    for key in (Payload.EN_ERRO_MSG, Payload.CH_ERRO_MSG):
+        if res.get(key):
+            return res[key].decode('utf-8', 'replace').strip('\0').strip()
+    return ''
+
+
+def configure_tcp_keepalive(sock, idle:int=60, interval:int=15, count:int=4) -> None:
+    """Let the OS notice a silently dead control channel.
+
+    Without keepalive a half-open TCP connection looks healthy forever and
+    the tunnel reports itself up while carrying nothing.
+    """
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+    except OSError:
+        return
+    for name, value in (('TCP_KEEPIDLE', idle), ('TCP_KEEPALIVE', idle),
+                        ('TCP_KEEPINTVL', interval), ('TCP_KEEPCNT', count)):
+        opt = getattr(socket, name, None)
+        if opt is None:
+            continue
+        try:
+            sock.setsockopt(socket.IPPROTO_TCP, opt, value)
+        except OSError:
+            pass
+
+
+def tls_socket() -> ssl.SSLSocket:
+    """TLS transport for the control channel.
+
+    The gateway certificate is deliberately not authenticated -- the vendor
+    client ships VerifyServerCert=false and the gateway is typically
+    self-signed. This buys confidentiality, not authentication.
+    """
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    return ctx.wrap_socket(socket.socket(socket.AF_INET, socket.SOCK_STREAM))
 
 
 class Message(object):
@@ -184,6 +250,27 @@ class Message(object):
         return b_prefix + size + b
 
 
+class IPSecAlgo(object):
+    """One ESP cipher suite plus the key material sizes it consumes."""
+    def __init__(self, crypt_algo, crypt_size, iv_size, auth_algo, auth_size,
+                 icv_size=12):
+        self.crypt_algo = crypt_algo
+        self.crypt_size = crypt_size
+        self.iv_size = iv_size
+        self.auth_algo = auth_algo
+        self.auth_size = auth_size
+        self.icv_size = icv_size
+
+
+# (ENC_ALG, AUTH_ALG) as returned by the gateway in the NEW_KEY reply.
+# auth_size is the HMAC key length (md5 -> 16, sha1 -> 20), crypt_size the
+# cipher key length. Add a row here to support another negotiated suite.
+IPSEC_ALGOS = {
+    (3, 2): IPSecAlgo('3DES', 0x18, 8, 'HMAC-SHA1-96', 0x14),
+    (12, 1): IPSecAlgo('AES-CBC', 0x10, 16, 'HMAC-MD5-96', 0x10),
+}
+
+
 class IPSecParameters(object):
     def __init__(self, in_spi, out_spi, keymat, iv_size, auth_size, crypt_size):
         from hashlib import sha1
@@ -207,12 +294,13 @@ class IPSecParameters(object):
 
 class ClientCore(object):
     def __init__(self):
-        self.socket = ssl.wrap_socket(socket.socket(socket.AF_INET, socket.SOCK_STREAM))
+        self.socket = tls_socket()
         self.client_ver = '1.0.0'
         self.server_host = ''
         self.server_port = -1
 
         self.ipsec_param = None
+        self.ipsec_algo = None
         self.session_id = -1
         self.server_udp_port = -1
         self.ip_ipv4 = None
@@ -225,6 +313,7 @@ class ClientCore(object):
         self.server_host = socket.gethostbyname(host)
         self.server_port = port
         self.socket.connect((self.server_host, self.server_port))
+        configure_tcp_keepalive(self.socket)
 
     def auth(self, username:str, password:str, host_id:str, host_name:str):
         m = Message(MessageType.AUTH)
@@ -235,9 +324,13 @@ class ClientCore(object):
         m.push_string(Payload.HOST_ID, host_id)
         m.push_string(Payload.HOST_NAME, host_name)
         self.socket.send(m.finish())
-        msg_id, res, _ = Unpack(self.socket.recv(4096))
+        msg_id, res, _ = recv_message(self.socket)
         if res[Payload.STATUS] != b'\0\0\0\0':
-            raise AuthError
+            code = int.from_bytes(res[Payload.STATUS], byteorder='big')
+            detail = _server_message(res)
+            raise AuthError('%s (status=%d)%s'
+                            % (auth_err_msg(code), code,
+                               ': ' + detail if detail else ''))
 
     def client_info(self):
         client_ipv4, server_ipv4 = '127.0.0.1', self.server_host
@@ -245,17 +338,17 @@ class ClientCore(object):
         m.push_ipv4(Payload.CLT_PUB_IPV4, client_ipv4)
         m.push_ipv4(Payload.SVR_PUB_IPV4, server_ipv4)
         self.socket.send(m.finish())
-        msg_id, res, _ = Unpack(self.socket.recv(4096))
+        msg_id, res, _ = recv_message(self.socket)
         if res[Payload.STATUS] != b'\0\0\0\0':
-            raise ClientInfoError
+            raise ClientInfoError(_server_message(res) or 'client info rejected')
 
     def wait_network(self):
         while True:
-            msg_id, res, _ = Unpack(self.socket.recv(4096))
+            msg_id, res, _ = recv_message(self.socket)
             if msg_id == MessageType.NONE:
                 continue
             if Payload.STATUS in res and res[Payload.STATUS] != b'\0\0\0\0':
-                raise NetworkInfoError
+                raise NetworkInfoError(_server_message(res) or 'network configuration rejected')
             elif msg_id == MessageType.SET_IP:
                 network = ipaddress.IPv4Network((0, str(ipaddress.IPv4Address(res[Payload.NETMASK_IPV4]))))
                 self.server_udp_port = int.from_bytes(res[Payload.SVR_UDP_PORT], byteorder='big')
@@ -282,14 +375,23 @@ class ClientCore(object):
         m.push_int(Payload.SPI, 4, inbound_spi)
         m.push_int(Payload.IPCOMP_CPI, 2, inbound_cpi)
         self.socket.send(m.finish())
-        msg_id, res, _ = Unpack(self.socket.recv(4096))
+        msg_id, res, _ = recv_message(self.socket)
         if res[Payload.STATUS] != b'\0\0\0\0':
-            raise NewKeyError
-        if res[Payload.ENC_ALG] != b'\0\x03' or res[Payload.AUTH_ALG] != b'\0\x02' or res[Payload.IPCOMP_ALG] != b'\0\0':
-            raise NotSupported
+            raise NewKeyError(_server_message(res) or 'key exchange rejected')
+        if res[Payload.IPCOMP_ALG] != b'\0\0':
+            raise NotSupported('gateway requested IP compression, not implemented')
+        enc_alg = int.from_bytes(res[Payload.ENC_ALG], byteorder='big')
+        auth_alg = int.from_bytes(res[Payload.AUTH_ALG], byteorder='big')
+        self.ipsec_algo = IPSEC_ALGOS.get((enc_alg, auth_alg))
+        if self.ipsec_algo is None:
+            raise NotSupported('gateway negotiated ENC_ALG=%d AUTH_ALG=%d, '
+                               'which is not in IPSEC_ALGOS' % (enc_alg, auth_alg))
         outbound_spi = int.from_bytes(res[Payload.SPI], byteorder='big')
         # outbound_cpi = int.from_bytes(res[Payload.IPCOMP_CPI], byteorder='big')
-        self.ipsec_param = IPSecParameters(inbound_spi, outbound_spi, key_material, auth_size=0x14, crypt_size=0x18, iv_size=8)
+        self.ipsec_param = IPSecParameters(inbound_spi, outbound_spi, key_material,
+                                           auth_size=self.ipsec_algo.auth_size,
+                                           crypt_size=self.ipsec_algo.crypt_size,
+                                           iv_size=self.ipsec_algo.iv_size)
         self.session_id = res[Payload.SESSION_ID]
 
     def logout(self):
