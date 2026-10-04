@@ -99,9 +99,18 @@ docker compose logs -f      # expect: "tunnel up on tun0 (mtu 1380)"
 docker compose ps           # expect: healthy
 ```
 
-A SOCKS5 proxy is then published on `127.0.0.1:1080` of the host. It is
-bound to loopback on purpose — reach it from elsewhere over SSH rather than
-exposing an open proxy to your LAN:
+A SOCKS5 proxy is published on `127.0.0.1:1080` by default. To let other
+machines use it directly, set `HILLSTONE_BIND` to this host's LAN address in
+an untracked `.env` next to `compose.yaml`:
+
+```
+HILLSTONE_BIND=192.168.5.4
+```
+
+Be aware what that means: the proxy has no authentication, so every device on
+that network gets your VPN exit and can reach whatever the gateway exposes.
+That is why the default stays on loopback. When the network is not fully
+trusted, keep the SSH forward instead:
 
 ```bash
 ssh -N -L 1080:127.0.0.1:1080 <host>
@@ -115,7 +124,9 @@ gateway, not your local line. Route only the domains that need it.
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
+| `HILLSTONE_BIND` | `127.0.0.1` | host address to publish SOCKS5 on; a LAN address lets other machines connect straight to it |
 | `HILLDUST_MTU` | 1380 | tun MTU; lower it if large packets still disappear |
+| `HILLDUST_BYPASS` | `192.168.0.0/16` | networks whose replies must not enter the tunnel. Clients reach the proxy over the host's LAN, so without this their replies are routed into the VPN and the connection hangs. Comma separated, empty to disable |
 | `HILLDUST_LIVENESS` | on | set to `off` to disable the data-plane probe |
 | `HILLDUST_LIVENESS_INTERVAL` | 15 | seconds between probes |
 | `HILLDUST_LIVENESS_FAILURES` | 3 | consecutive misses before reconnecting |

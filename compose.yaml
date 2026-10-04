@@ -21,9 +21,11 @@ services:
       - secret.env          # HILLSTONE_SERVER / _USER / _PASSWORD
 
     ports:
-      # loopback only -- reach it from another machine with an SSH forward:
-      #   ssh -N -L 1080:127.0.0.1:1080 <host>
-      - "127.0.0.1:1080:1080"
+      # HILLSTONE_BIND defaults to loopback: nothing outside this host can
+      # reach the tunnel. Set it to a LAN address (in an untracked .env) to
+      # let other machines use the proxy directly -- but note that anyone on
+      # that network then has your VPN exit, unauthenticated.
+      - "${HILLSTONE_BIND:-127.0.0.1}:1080:1080"
 
     healthcheck:
       # The 0.0.0.0/1 split route exists only while a session is up.

@@ -25,6 +25,12 @@ IFF_NO_PI = 0x1000
 # fragmented or dropped. The vendor client ships VnicMTU=1380.
 DEFAULT_MTU = 1380
 
+# Networks whose replies must NOT be routed into the tunnel. The SOCKS port
+# is reached over the host's LAN, and without this the /1 routes below would
+# send those replies into the VPN, hanging the connection. Comma separated;
+# set HILLDUST_BYPASS to override, or to empty to disable.
+DEFAULT_BYPASS = '192.168.0.0/16'
+
 # The two halves of 0.0.0.0/0, used instead of replacing the default route.
 SPLIT_DEFAULT = ('0.0.0.0/1', '128.0.0.0/1')
 
@@ -60,6 +66,11 @@ def _current_path_to(host):
     via = out[out.index('via') + 1] if 'via' in out else None
     dev = out[out.index('dev') + 1] if 'dev' in out else None
     return via, dev
+
+
+def _bypass_networks():
+    raw = os.environ.get('HILLDUST_BYPASS', DEFAULT_BYPASS)
+    return [item.strip() for item in raw.split(',') if item.strip()]
 
 
 def _write_resolv(c):
@@ -106,6 +117,16 @@ def set_network(c):
         _add_route(str(c.ip_ipv4.network), 'via', str(c.gateway_ipv4))
         for prefix in SPLIT_DEFAULT:
             _add_route(prefix, 'via', str(c.gateway_ipv4), 'dev', tun_name)
+
+        # Clients reach the SOCKS port over the host's LAN, so their replies
+        # have to go back out the bridge rather than into the tunnel.
+        for network in _bypass_networks():
+            args = [network]
+            if via:
+                args += ['via', via]
+            if dev:
+                args += ['dev', dev]
+            _add_route(*args)
 
         _write_resolv(c)
     except Exception:

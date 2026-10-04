@@ -91,8 +91,17 @@ docker compose logs -f      # 期望看到 "tunnel up on tun0 (mtu 1380)"
 docker compose ps           # 期望 healthy
 ```
 
-SOCKS5 代理会发布在宿主机的 `127.0.0.1:1080`。**只绑回环是有意为之** ——
-从别的机器访问请走 SSH 转发，而不是把开放代理暴露给整个局域网：
+SOCKS5 代理默认发布在宿主机的 `127.0.0.1:1080`。要让别的机器直接连，在
+`compose.yaml` 旁边放一个未被跟踪的 `.env`，把 `HILLSTONE_BIND` 设成本机的
+局域网地址：
+
+```
+HILLSTONE_BIND=192.168.5.4
+```
+
+请清楚这意味着什么：这个代理**没有任何认证**，该网络上的每一台设备都会拿到你的
+VPN 出口，并能访问网关暴露的一切。默认绑回环正是因为这个。网络不完全可信时，
+请改用 SSH 转发：
 
 ```bash
 ssh -N -L 1080:127.0.0.1:1080 <host>
@@ -106,7 +115,9 @@ curl --socks5-hostname 127.0.0.1:1080 https://api.ipify.org
 
 | 环境变量 | 默认 | 作用 |
 | --- | --- | --- |
+| `HILLSTONE_BIND` | `127.0.0.1` | SOCKS5 发布到宿主机哪个地址；设成局域网地址则别的机器可直连 |
 | `HILLDUST_MTU` | 1380 | tun MTU；若大包仍然丢失可继续调低 |
+| `HILLDUST_BYPASS` | `192.168.0.0/16` | 哪些网段的回包不能进隧道。客户端是经宿主局域网连到代理的，没有这条旁路，回包会被送进 VPN，连接直接挂住。逗号分隔，留空则关闭 |
 | `HILLDUST_LIVENESS` | 开 | 设为 `off` 关闭数据面探测 |
 | `HILLDUST_LIVENESS_INTERVAL` | 15 | 两次探测间隔（秒） |
 | `HILLDUST_LIVENESS_FAILURES` | 3 | 连续失败多少次后重连 |
