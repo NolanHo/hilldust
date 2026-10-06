@@ -28,8 +28,10 @@ services:
       - "${HILLSTONE_BIND:-127.0.0.1}:1080:1080"
 
     healthcheck:
-      # The 0.0.0.0/1 split route exists only while a session is up.
-      test: ["CMD-SHELL", "ip route show 0.0.0.0/1 2>/dev/null | grep -q ."]
+      # Both halves matter: the /1 route exists only while a session is up,
+      # and the listener is what actually answers. Checking the route alone
+      # reports healthy while the proxy is dead.
+      test: ["CMD-SHELL", "ip route show 0.0.0.0/1 2>/dev/null | grep -q . && ss -tln 2>/dev/null | grep -q ':1080'"]
       interval: 30s
       timeout: 5s
       retries: 3

@@ -9,10 +9,25 @@ set -euo pipefail
 : "${HILLSTONE_USER:?HILLSTONE_USER not set}"
 : "${HILLSTONE_PASSWORD:?HILLSTONE_PASSWORD not set}"
 
-echo "[*] SOCKS5 on 0.0.0.0:${SOCKS_PORT:-1080} (container netns only)" >&2
-microsocks -i 0.0.0.0 -p "${SOCKS_PORT:-1080}" -q &
-sleep 0.3
-kill -0 $! 2>/dev/null || { echo "[!] microsocks failed to start" >&2; exit 1; }
+PORT="${SOCKS_PORT:-1080}"
+
+# Restarted in a loop rather than started once. If this listener dies the
+# port stops answering while the tunnel happily keeps running, and nothing
+# else would notice -- which is exactly how it failed once already.
+(
+    while :; do
+        microsocks -i 0.0.0.0 -p "$PORT" -q || true
+        echo "[!] microsocks exited, restarting in 1s" >&2
+        sleep 1
+    done
+) &
+
+sleep 0.5
+if ! ss -tln 2>/dev/null | grep -q ":${PORT}"; then
+    echo "[!] microsocks is not listening on ${PORT}" >&2
+    exit 1
+fi
+echo "[*] SOCKS5 on 0.0.0.0:${PORT} (container netns only)" >&2
 
 cd /opt/hilldust
 # exec so hilldust becomes PID 1 and receives SIGTERM directly from Docker,
